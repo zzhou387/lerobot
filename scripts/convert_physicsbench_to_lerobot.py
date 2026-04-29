@@ -1,6 +1,15 @@
 """Convert a PhysicsBench-format dataset to a LeRobot-policy-ready local dataset.
 
-Auto-detects from source ``info.json``:
+Supports both PhysicsBench codebase versions:
+
+- **v2.1**: per-episode parquet (``data/chunk-XXX/episode_<ID>.parquet``),
+  per-episode mp4 per camera (``videos/chunk-XXX/<cam>/episode_<ID>.mp4``),
+  per-episode metadata JSONs (``meta/episode_<ID>_metadata.json``) carrying
+  ``annotation_rating`` (4 = success-with-recovery, 5 = clean single-shot).
+- **v3.0**: episode meta parquet under ``meta/episodes/`` listing positional
+  ranges into shared multi-episode parquets / mp4s.
+
+Auto-detects from source ``info.json`` (in either layout):
   - Cameras: every feature with ``dtype="video"``. ``observation.rgb_<label>_cam``
     is renamed to ``observation.images.<label>``; other shapes fall back to
     ``observation.images.<sanitized>``.
@@ -9,6 +18,10 @@ Auto-detects from source ``info.json``:
     some 1 — e.g. suction).
   - Action dim and task description: read from source.
 
+For v2.1 only, ``--min-rating N`` filters episodes by ``annotation_rating``
+(default 5: keep only clean single-shot demos; pass 4 to also include
+recovery-style demos).
+
 Builds ``observation.state`` = concat over arms of ``[eef_pos, eef_quat,
 gripper_qpos]``. Optionally append force/torque with ``--include-ft``.
 
@@ -16,20 +29,26 @@ Subsamples 100 Hz proprio rows to the camera frame rate (default 25 Hz) using
 the first video key's ``frame_index.<key>`` column. PhysicsBench renders cameras
 at 25 Hz with frame caching between renders, so this is lossless.
 
-Privileged sim state (``observation.object_*``, ``cube_*``, etc.) is dropped via
-the whitelist approach (we only KEEP what's explicitly built).
+Privileged sim state (``observation.object_*``, etc.) is dropped via the
+whitelist approach (we only KEEP what's explicitly built).
 
 Usage:
-    # Single-arm edge-slide, 10 episodes for laptop sanity check
+    # v2.1 single-arm edge-slide, 10 rating-5 episodes, laptop sanity check
+    uv run python scripts/convert_physicsbench_to_lerobot.py \\
+      --src-path ~/manav/dataset/pb-pr-edge-slide-v1 \\
+      --dst-repo-id manav-robotics/pb-pr-edge-slide-v1-lerobot \\
+      --num-episodes 10
+
+    # v2.1, full conversion, include rating-4 (recovery) episodes too
+    uv run python scripts/convert_physicsbench_to_lerobot.py \\
+      --src-path ~/manav/dataset/pb-pr-edge-slide-v1 \\
+      --dst-repo-id manav-robotics/pb-pr-edge-slide-v1-lerobot \\
+      --num-episodes -1 --min-rating 4
+
+    # v3.0 from HF Hub cache (legacy path)
     uv run python scripts/convert_physicsbench_to_lerobot.py \\
       --src-repo-id manav-robotics/pb-pr-edge-slide-v1 \\
       --num-episodes 10
-
-    # Bimanual task, full conversion, include F/T in state
-    uv run python scripts/convert_physicsbench_to_lerobot.py \\
-      --src-repo-id manav-robotics/pb-hetbi-bowl-table-v1 \\
-      --num-episodes -1 \\
-      --include-ft
 """
 
 from __future__ import annotations
@@ -38,6 +57,7 @@ import argparse
 import json
 import re
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -55,7 +75,7 @@ LEROBOT_CACHE = Path.home() / ".cache" / "huggingface" / "lerobot"
 
 
 def resolve_src_path(repo_id: str | None, src_path: Path | None) -> Path:
-    """Resolve source snapshot dir from a repo_id (via HF Hub cache) or direct path."""
+    """Resolve source dataset dir from a repo_id (HF Hub cache) or direct path."""
     if src_path is not None:
         if not src_path.is_dir():
             raise FileNotFoundError(f"--src-path does not exist: {src_path}")
@@ -79,7 +99,7 @@ def resolve_src_path(repo_id: str | None, src_path: Path | None) -> Path:
     return snapshots[0]
 
 
-# ── feature detection ───────────────────────────────────────────────────────
+# ── feature detection (shared across versions) ─────────────────────────────
 
 
 _CAM_NAME_RE = re.compile(r"^observation\.rgb_(?P<label>.+)_cam$")
@@ -119,6 +139,26 @@ def detect_arms(features: dict) -> list[int]:
     return sorted(arms)
 
 
+def infer_features_from_parquet(parquet_path: Path) -> dict:
+    """Group parquet columns of the form ``<base>.<i>`` into ``{base: {shape: [N]}}``.
+
+    v2.1 info.json doesn't list proprio/action features; they're only implied by
+    the per-element columns in the data parquet. We read the parquet schema once
+    and reconstruct the shapes.
+    """
+    schema = pd.read_parquet(parquet_path, columns=None).head(0)
+    shapes: dict[str, int] = {}
+    for col in schema.columns:
+        if "." in col:
+            base, suffix = col.rsplit(".", 1)
+            if suffix.isdigit():
+                shapes[base] = max(shapes.get(base, 0), int(suffix) + 1)
+    return {
+        base: {"dtype": "float32", "shape": [size]}
+        for base, size in shapes.items()
+    }
+
+
 def state_recipe(features: dict, arms: list[int], include_ft: bool) -> tuple[list[str], list[str]]:
     """Return (per-element source columns, human-readable names) for observation.state."""
     cols: list[str] = []
@@ -150,7 +190,7 @@ def state_recipe(features: dict, arms: list[int], include_ft: bool) -> tuple[lis
 
 
 def action_columns(features: dict) -> tuple[list[str], list[str]]:
-    """Per-element action columns + human names. PhysicsBench layout: [dx,dy,dz,droll,dpitch,dyaw,gripper] per arm."""
+    """Per-element action columns + human names. PhysicsBench: [dx,dy,dz,droll,dpitch,dyaw,gripper] per arm."""
     if "action" not in features:
         raise ValueError("Source missing 'action' feature.")
     dim = features["action"]["shape"][0]
@@ -168,56 +208,195 @@ def action_columns(features: dict) -> tuple[list[str], list[str]]:
     return cols, names
 
 
+# ── per-episode read result, version-agnostic ───────────────────────────────
+
+
+@dataclass
+class EpisodePayload:
+    """Output of a per-version reader: everything needed to write one episode."""
+    episode_id: str
+    sub_df: pd.DataFrame              # rows already subsampled to camera rate
+    cam_indices: np.ndarray           # per-row frame-index into each cam's mp4
+    cam_video_paths: dict[str, Path]  # source video file path keyed by source cam key
+    task_text: str
+
+
+def _read_episode_rows(parquet_path: Path, cam_rate_col: str, needed_cols: list[str]) -> tuple[pd.DataFrame, int]:
+    """Load a parquet, subsample to camera rate, return (sub_df, full_len)."""
+    df = pd.read_parquet(parquet_path, columns=needed_cols)
+    full_len = len(df)
+    sub = df[df[cam_rate_col].notna()].reset_index(drop=True)
+    return sub, full_len
+
+
+# ── v2.1 reader ─────────────────────────────────────────────────────────────
+
+
+def _v21_extract_id(meta_path: Path) -> str:
+    """`meta/episode_000074_metadata.json` → '000074'."""
+    return meta_path.stem.removeprefix("episode_").removesuffix("_metadata")
+
+
+def _v21_episode_chunk_dir(src: Path, episode_id: str, kind: str, cam: str | None = None) -> Path:
+    """Find which `chunk-XXX/` holds this episode's data/video. Falls back to globbing."""
+    if kind == "data":
+        candidates = sorted((src / "data").glob(f"chunk-*/episode_{episode_id}.parquet"))
+    else:
+        candidates = sorted((src / "videos").glob(f"chunk-*/{cam}/episode_{episode_id}.mp4"))
+    if not candidates:
+        raise FileNotFoundError(f"v2.1 {kind} file for episode {episode_id} not found under {src}")
+    return candidates[0]
+
+
+def iter_v21(
+    src: Path,
+    cam_rename: dict[str, str],
+    cam_rate_col: str,
+    needed_cols: list[str],
+    min_rating: int,
+    max_episodes: int,
+):
+    """Yield EpisodePayload for v2.1 datasets, filtered by annotation_rating."""
+    meta_files = sorted((src / "meta").glob("episode_*_metadata.json"))
+    if not meta_files:
+        raise FileNotFoundError(f"No v2.1 episode metadata under {src}/meta/")
+
+    kept = 0
+    skipped = 0
+    for meta_path in meta_files:
+        meta = json.loads(meta_path.read_text())
+        rating = meta.get("annotation_rating")
+        if rating is None or rating < min_rating:
+            skipped += 1
+            continue
+
+        episode_id = _v21_extract_id(meta_path)
+        parquet_path = _v21_episode_chunk_dir(src, episode_id, "data")
+        sub_df, full_len = _read_episode_rows(parquet_path, cam_rate_col, needed_cols)
+
+        video_paths = {
+            src_key: _v21_episode_chunk_dir(src, episode_id, "video", cam=src_key.removeprefix("observation."))
+            for src_key in cam_rename
+        }
+
+        task_text = (
+            meta.get("task_name")
+            or meta.get("task_id")
+            or "task"
+        )
+
+        yield EpisodePayload(
+            episode_id=episode_id,
+            sub_df=sub_df,
+            cam_indices=sub_df[cam_rate_col].to_numpy(dtype=np.int64),
+            cam_video_paths=video_paths,
+            task_text=task_text,
+        ), full_len
+
+        kept += 1
+        if max_episodes > 0 and kept >= max_episodes:
+            break
+
+    print(f"[v21] kept {kept}, skipped {skipped} (rating < {min_rating})")
+
+
+# ── v3.0 reader ─────────────────────────────────────────────────────────────
+
+
+def iter_v3(
+    src: Path,
+    cam_rename: dict[str, str],
+    cam_rate_col: str,
+    needed_cols: list[str],
+    max_episodes: int,
+):
+    """Yield EpisodePayload for v3.0 datasets (shared multi-episode parquets/mp4s)."""
+    files = sorted((src / "meta" / "episodes").glob("chunk-*/file-*.parquet"))
+    if not files:
+        raise FileNotFoundError(f"No v3.0 episode metadata under {src}/meta/episodes/")
+    ep_meta = pd.concat([pd.read_parquet(p) for p in files], ignore_index=True)
+    ep_meta = ep_meta.sort_values("episode_index").reset_index(drop=True)
+
+    n_total = len(ep_meta)
+    n = n_total if max_episodes < 0 else min(max_episodes, n_total)
+    print(f"[v3] episodes available: {n_total}, processing: {n}")
+
+    parquet_cache: dict[tuple[int, int], pd.DataFrame] = {}
+
+    for ep_idx in range(n):
+        ep_row = ep_meta.iloc[ep_idx]
+        data_chunk = int(ep_row["data/chunk_index"])
+        data_file = int(ep_row["data/file_index"])
+        from_idx = int(ep_row["dataset_from_index"])
+        to_idx = int(ep_row["dataset_to_index"])
+
+        if (data_chunk, data_file) not in parquet_cache:
+            parquet_cache[(data_chunk, data_file)] = pd.read_parquet(
+                src / "data" / f"chunk-{data_chunk:03d}" / f"file-{data_file:03d}.parquet",
+                columns=needed_cols,
+            )
+        df = parquet_cache[(data_chunk, data_file)].iloc[from_idx:to_idx]
+        full_len = len(df)
+        sub = df[df[cam_rate_col].notna()].reset_index(drop=True)
+
+        # In v3, cam frame indices are GLOBAL within the cam's shared mp4 file.
+        # We resolve the file at read time instead of caching per-episode.
+        video_paths = {
+            src_key: (
+                src / "videos" / src_key
+                / f"chunk-{int(ep_row[f'videos/{src_key}/chunk_index']):03d}"
+                / f"file-{int(ep_row[f'videos/{src_key}/file_index']):03d}.mp4"
+            )
+            for src_key in cam_rename
+        }
+
+        yield EpisodePayload(
+            episode_id=str(int(ep_row["episode_index"])),
+            sub_df=sub,
+            cam_indices=sub[cam_rate_col].to_numpy(dtype=np.int64),
+            cam_video_paths=video_paths,
+            task_text="",  # filled in by caller (uses global task description from info.json)
+        ), full_len
+
+
 # ── camera reader ───────────────────────────────────────────────────────────
 
 
-class CameraReader:
-    """Lazy per-mp4 VideoDecoder cache."""
+class VideoDecoderCache:
+    """Lazy mp4 → VideoDecoder cache, keyed by file path."""
 
-    def __init__(self, src: Path):
-        self.src = src
+    def __init__(self):
         self._cache: dict[str, VideoDecoder] = {}
 
-    def get(self, src_cam_key: str, chunk_index: int, file_index: int) -> VideoDecoder:
-        path = (
-            self.src / "videos" / src_cam_key
-            / f"chunk-{chunk_index:03d}" / f"file-{file_index:03d}.mp4"
-        )
+    def read_frame(self, path: Path, frame_idx: int) -> np.ndarray:
         key = str(path)
         if key not in self._cache:
-            self._cache[key] = VideoDecoder(str(path), seek_mode="approximate")
-        return self._cache[key]
-
-    def read_frame(self, src_cam_key: str, chunk_index: int, file_index: int, frame_idx: int) -> np.ndarray:
-        decoder = self.get(src_cam_key, chunk_index, file_index)
-        frame = decoder.get_frame_at(index=int(frame_idx)).data
+            self._cache[key] = VideoDecoder(key, seek_mode="approximate")
+        frame = self._cache[key].get_frame_at(index=int(frame_idx)).data
         if frame.dtype != torch.uint8:
             frame = frame.to(torch.uint8)
         return frame.permute(1, 2, 0).contiguous().numpy()
 
+    def probe_shape(self, path: Path) -> tuple[int, int, int]:
+        """Return (H, W, C) of the first frame of the given mp4."""
+        key = str(path)
+        if key not in self._cache:
+            self._cache[key] = VideoDecoder(key, seek_mode="approximate")
+        frame = self._cache[key].get_frame_at(index=0).data  # CHW
+        return int(frame.shape[1]), int(frame.shape[2]), int(frame.shape[0])
 
-# ── main flow ───────────────────────────────────────────────────────────────
 
-
-def load_episode_meta(src: Path) -> pd.DataFrame:
-    """Load and concatenate all episode metadata parquets, sorted by episode_index."""
-    files = sorted((src / "meta" / "episodes").glob("chunk-*/file-*.parquet"))
-    if not files:
-        raise FileNotFoundError(f"No episode metadata under {src}/meta/episodes/")
-    df = pd.concat([pd.read_parquet(p) for p in files], ignore_index=True)
-    return df.sort_values("episode_index").reset_index(drop=True)
+# ── features dict construction ──────────────────────────────────────────────
 
 
 def build_features_dict(
-    src_features: dict,
     cam_rename: dict[str, str],
     state_dim: int,
     state_names: list[str],
     action_dim: int,
     action_names: list[str],
+    video_shape: tuple[int, int, int],
 ) -> dict:
-    sample_video = next(iter(cam_rename))
-    h, w, c = src_features[sample_video]["shape"]
     return {
         "observation.state": {
             "dtype": "float32",
@@ -232,16 +411,15 @@ def build_features_dict(
         **{
             new_key: {
                 "dtype": "video",
-                "shape": (
-                    src_features[old_key]["shape"][0],
-                    src_features[old_key]["shape"][1],
-                    src_features[old_key]["shape"][2],
-                ),
+                "shape": video_shape,
                 "names": ["height", "width", "channels"],
             }
-            for old_key, new_key in cam_rename.items()
+            for new_key in cam_rename.values()
         },
     }
+
+
+# ── main flow ───────────────────────────────────────────────────────────────
 
 
 def convert(
@@ -250,32 +428,39 @@ def convert(
     num_episodes: int,
     include_ft: bool,
     overwrite: bool,
+    min_rating: int,
 ) -> None:
     src_info = json.loads((src / "meta" / "info.json").read_text())
-    src_features = src_info["features"]
+    src_features = dict(src_info["features"])
+    codebase_version = src_info.get("codebase_version", "v2.1")
+
+    # v2.1 info.json doesn't enumerate proprio/action features — infer them from
+    # a sample parquet's per-element columns and merge in.
+    sample_parquet = next((src / "data").glob("chunk-*/*.parquet"))
+    inferred = infer_features_from_parquet(sample_parquet)
+    for base, ft in inferred.items():
+        src_features.setdefault(base, ft)
 
     cam_rename = detect_cameras(src_features)
     arms = detect_arms(src_features)
     state_cols, state_names = state_recipe(src_features, arms, include_ft)
     action_cols, action_names = action_columns(src_features)
 
-    # Pick the first video key's frame_index column as the camera-rate reference.
     first_cam_src = next(iter(cam_rename))
     cam_rate_col = f"frame_index.{first_cam_src.removeprefix('observation.')}"
-    if cam_rate_col not in {*src_features.keys(), cam_rate_col}:
-        # The frame_index features are stored as integer features; verify by
-        # checking if any matching column exists in the parquet schema later.
-        pass  # we'll catch it when reading parquet
     cam_fps = src_features[first_cam_src].get("fps")
     if cam_fps is None:
         raise ValueError(f"Source camera feature {first_cam_src} missing fps.")
 
     print(f"[convert] src: {src}")
+    print(f"[convert] codebase_version: {codebase_version}")
     print(f"[convert] arms detected: {arms}")
     print(f"[convert] cameras: {cam_rename}")
     print(f"[convert] state dim: {len(state_cols)}{' (includes F/T)' if include_ft else ''}")
     print(f"[convert] action dim: {len(action_cols)}")
     print(f"[convert] target fps: {cam_fps}")
+    if codebase_version.startswith("v2"):
+        print(f"[convert] min annotation_rating: {min_rating}")
 
     dst_root = LEROBOT_CACHE / dst_repo_id
     if dst_root.exists():
@@ -286,20 +471,41 @@ def convert(
         shutil.rmtree(dst_root)
     dst_root.parent.mkdir(parents=True, exist_ok=True)
 
-    ep_meta = load_episode_meta(src)
-    n_total = len(ep_meta)
-    n = n_total if num_episodes < 0 else min(num_episodes, n_total)
-    print(f"[convert] episodes available: {n_total}, processing: {n}")
+    # Probe video shape: v2.1 info.json has empty shape, so we read the first
+    # frame from a real mp4. For v3, the info.json has it but probing still works.
+    decoders = VideoDecoderCache()
+    if codebase_version.startswith("v2"):
+        sample_meta = next((src / "meta").glob("episode_*_metadata.json"))
+        sample_id = _v21_extract_id(sample_meta)
+        sample_video = _v21_episode_chunk_dir(
+            src, sample_id, "video", cam=first_cam_src.removeprefix("observation.")
+        )
+    else:
+        sample_video = next((src / "videos" / first_cam_src).glob("chunk-*/file-*.mp4"))
+    video_shape = decoders.probe_shape(sample_video)
+    print(f"[convert] video shape: {video_shape}")
 
-    task_description = (
-        src_info.get("task_config", {}).get("description")
-        or src_info.get("task_id")
-        or "task"
-    )
-    print(f"[convert] task description: {task_description!r}")
+    needed_cols = [cam_rate_col] + state_cols + action_cols
+
+    if codebase_version.startswith("v2"):
+        episode_iter = iter_v21(src, cam_rename, cam_rate_col, needed_cols, min_rating, num_episodes)
+        global_task_text = (
+            src_info.get("task_config", {}).get("description")
+            or src_info.get("task_id")
+            or "task"
+        )
+    elif codebase_version.startswith("v3"):
+        episode_iter = iter_v3(src, cam_rename, cam_rate_col, needed_cols, num_episodes)
+        global_task_text = (
+            src_info.get("task_config", {}).get("description")
+            or src_info.get("task_id")
+            or "task"
+        )
+    else:
+        raise ValueError(f"Unsupported codebase_version: {codebase_version}")
 
     features = build_features_dict(
-        src_features, cam_rename, len(state_cols), state_names, len(action_cols), action_names
+        cam_rename, len(state_cols), state_names, len(action_cols), action_names, video_shape
     )
 
     new_ds = LeRobotDataset.create(
@@ -311,50 +517,26 @@ def convert(
     )
     print(f"[convert] writing to: {new_ds.root}")
 
-    cams = CameraReader(src)
-    needed_cols = [cam_rate_col] + state_cols + action_cols
-    data_cache: dict[tuple[int, int], pd.DataFrame] = {}
+    written = 0
+    for payload, full_len in episode_iter:
+        state_arr = payload.sub_df[state_cols].to_numpy(dtype=np.float32)
+        action_arr = payload.sub_df[action_cols].to_numpy(dtype=np.float32)
+        task_text = payload.task_text or global_task_text
 
-    for ep_idx in range(n):
-        ep_row = ep_meta.iloc[ep_idx]
-        data_chunk = int(ep_row["data/chunk_index"])
-        data_file = int(ep_row["data/file_index"])
-        from_idx = int(ep_row["dataset_from_index"])
-        to_idx = int(ep_row["dataset_to_index"])
-
-        if (data_chunk, data_file) not in data_cache:
-            data_cache[(data_chunk, data_file)] = pd.read_parquet(
-                src / "data" / f"chunk-{data_chunk:03d}" / f"file-{data_file:03d}.parquet",
-                columns=needed_cols,
-            )
-        df = data_cache[(data_chunk, data_file)].iloc[from_idx:to_idx]
-        sub = df[df[cam_rate_col].notna()].reset_index(drop=True)
-
-        cam_locations = {
-            src_key: (
-                int(ep_row[f"videos/{src_key}/chunk_index"]),
-                int(ep_row[f"videos/{src_key}/file_index"]),
-            )
-            for src_key in cam_rename
-        }
-
-        state_arr = sub[state_cols].to_numpy(dtype=np.float32)
-        action_arr = sub[action_cols].to_numpy(dtype=np.float32)
-        cam_indices = sub[cam_rate_col].to_numpy(dtype=np.int64)
-
-        for i in range(len(sub)):
+        for i in range(len(payload.sub_df)):
             frame: dict = {
-                "task": task_description,
+                "task": task_text,
                 "observation.state": state_arr[i],
                 "action": action_arr[i],
             }
             for src_key, new_key in cam_rename.items():
-                ck, fk = cam_locations[src_key]
-                frame[new_key] = cams.read_frame(src_key, ck, fk, cam_indices[i])
+                frame[new_key] = decoders.read_frame(
+                    payload.cam_video_paths[src_key], payload.cam_indices[i]
+                )
             new_ds.add_frame(frame)
-
         new_ds.save_episode()
-        print(f"[convert] ep {ep_idx + 1}/{n}: wrote {len(sub)} frames (orig length {len(df)} @ source rate)")
+        written += 1
+        print(f"[convert] ep {payload.episode_id}: wrote {len(payload.sub_df)} frames (orig {full_len} @ source rate)")
 
     new_ds.finalize()
     print(f"[convert] done. dataset at {new_ds.root}")
@@ -372,7 +554,7 @@ def main() -> None:
     src_group.add_argument(
         "--src-path",
         type=Path,
-        help="Direct path to the source snapshot dir. Use when not in HF Hub cache.",
+        help="Direct path to the source dataset dir (use for v2.1 local datasets).",
     )
     parser.add_argument(
         "--dst-repo-id",
@@ -380,6 +562,12 @@ def main() -> None:
         "Defaults to '<src-repo-id>-lerobot' (with '-ft' suffix if --include-ft).",
     )
     parser.add_argument("--num-episodes", type=int, default=10, help="Episodes to convert. -1 for all.")
+    parser.add_argument(
+        "--min-rating",
+        type=int,
+        default=5,
+        help="v2.1 only: minimum annotation_rating to keep. 5 = clean only, 4 = also include recovery.",
+    )
     parser.add_argument(
         "--include-ft",
         action="store_true",
@@ -401,7 +589,7 @@ def main() -> None:
     else:
         raise ValueError("Provide --dst-repo-id when using --src-path.")
 
-    convert(src, dst_repo_id, args.num_episodes, args.include_ft, args.overwrite)
+    convert(src, dst_repo_id, args.num_episodes, args.include_ft, args.overwrite, args.min_rating)
 
 
 if __name__ == "__main__":

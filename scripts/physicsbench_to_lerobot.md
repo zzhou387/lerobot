@@ -35,8 +35,63 @@ to cheat.
 
 The conversion script [scripts/convert_physicsbench_to_lerobot.py](convert_physicsbench_to_lerobot.py)
 fixes all of this in one pass — generalized to any PhysicsBench task, not just
-edge-slide. It auto-detects cameras, arms, action dim, and task description from
-the source `info.json`.
+edge-slide. It auto-detects cameras, arms, action dim, video shape, and task
+description from the source, and supports **both PhysicsBench codebase versions**
+(v2.1 and v3.0) via auto-dispatch on `codebase_version` in `info.json`.
+
+---
+
+## 1b. Source layout: v2.1 vs v3.0
+
+The team has standardized on **PhysicsBench v2.1** for training going forward.
+The converter auto-detects which version it's looking at via `codebase_version`
+in `info.json` and dispatches to the right reader.
+
+### v2.1 layout (recommended; what to use)
+```
+<src>/
+├── meta/
+│   ├── info.json                  # only declares cameras + frame_index; proprio/action inferred from parquet
+│   ├── episodes.jsonl
+│   ├── tasks.jsonl
+│   └── episode_<ID>_metadata.json # ⭐ has annotation_rating ∈ {4, 5}
+├── data/chunk-XXX/
+│   └── episode_<ID>.parquet       # one parquet per episode
+└── videos/chunk-XXX/<cam>/
+    └── episode_<ID>.mp4           # one mp4 per episode per camera
+```
+
+Per-episode metadata JSONs include `annotation_rating`:
+- **5** = clean single-shot success (most common)
+- **4** = success with recovery (the operator retried mid-episode)
+
+**Recommendation from the data team:** start sanity-checks with rating = 5 only.
+Rating-4 episodes are useful for inducing recovery behavior but add noise to
+the demo distribution. The script defaults to `--min-rating 5`; pass
+`--min-rating 4` to include both.
+
+In our edge-slide v2.1 dataset (823 episodes total): **751 rating-5, 72
+rating-4**. All 823 outcomes = "success".
+
+### v3.0 layout (legacy — first run notes use this)
+```
+<src>/
+├── meta/
+│   ├── info.json
+│   ├── episodes/chunk-XXX/file-YYY.parquet  # all episodes' meta in one parquet
+│   └── tasks.parquet
+├── data/chunk-XXX/file-YYY.parquet          # multi-episode; episode-meta has from/to indices
+└── videos/<cam>/chunk-XXX/file-YYY.mp4      # multi-episode mp4
+```
+
+Episode meta gives positional row offsets (`dataset_from_index`,
+`dataset_to_index`) into the shared parquet, plus per-camera `chunk_index/file_index`
+identifying the shared mp4. Per-camera frame indices in the data parquet
+(`frame_index.rgb_*_cam`) are **global** within each shared mp4.
+
+The first-run findings in §2-§5 below were all collected on v3.0 of edge-slide.
+The corresponding v2.1 dataset (more episodes, same task) is the one to actually
+train on.
 
 ---
 
@@ -301,11 +356,13 @@ Wiring (2) up is a separate task — not in scope for this report.
 
 - [scripts/convert_physicsbench_to_lerobot.py](convert_physicsbench_to_lerobot.py) —
   generalized PhysicsBench → LeRobot converter. Auto-detects cameras, arms,
-  action dim, and task description from the source `info.json`. Reusable for
-  other tasks (single-arm and bimanual). Flags:
-    - `--src-repo-id <id>` (required, or `--src-path <dir>`)
+  action dim, video shape, and task description from the source. Reusable for
+  other tasks (single-arm and bimanual) and both codebase versions (v2.1, v3.0).
+  Flags:
+    - `--src-repo-id <id>` (HF Hub cache lookup) **or** `--src-path <dir>` (local v2.1)
     - `--dst-repo-id <id>` (default: `<src>-lerobot` or `<src>-lerobot-ft`)
     - `--num-episodes N` (default 10; `-1` for all)
+    - `--min-rating N` (v2.1 only; default 5 = clean only, 4 = include recovery)
     - `--include-ft` to append `observation.force_torque` to `observation.state`
     - `--overwrite` to delete an existing destination
 - [scripts/physicsbench_to_lerobot.md](physicsbench_to_lerobot.md) — this guide / first-run notes.
@@ -315,13 +372,31 @@ Wiring (2) up is a separate task — not in scope for this report.
 
 ## 9. Reusing the converter on other PhysicsBench tasks
 
-The converter is task-agnostic. For another task you just download the source
-and run the same command:
+The converter is task-agnostic and version-agnostic. Examples:
 
 ```bash
-hf download --repo-type=dataset manav-robotics/pb-hetbi-bowl-table-v1
+# v2.1 local dataset, only clean (rating-5) episodes
 uv run python scripts/convert_physicsbench_to_lerobot.py \
-  --src-repo-id manav-robotics/pb-hetbi-bowl-table-v1 \
+  --src-path ~/manav/dataset/pb-pr-edge-slide-v1 \
+  --dst-repo-id manav-robotics/pb-pr-edge-slide-v1-lerobot \
+  --num-episodes -1
+
+# v2.1, include rating-4 (recovery) too
+uv run python scripts/convert_physicsbench_to_lerobot.py \
+  --src-path ~/manav/dataset/pb-pr-edge-slide-v1 \
+  --dst-repo-id manav-robotics/pb-pr-edge-slide-v1-lerobot-r4 \
+  --num-episodes -1 --min-rating 4
+
+# v2.1 bimanual task
+uv run python scripts/convert_physicsbench_to_lerobot.py \
+  --src-path ~/manav/dataset/pb-hetbi-bowl-table-v1 \
+  --dst-repo-id manav-robotics/pb-hetbi-bowl-table-v1-lerobot \
+  --num-episodes 10
+
+# v3.0 from HF Hub cache (legacy)
+hf download --repo-type=dataset manav-robotics/pb-pr-edge-slide-v1
+uv run python scripts/convert_physicsbench_to_lerobot.py \
+  --src-repo-id manav-robotics/pb-pr-edge-slide-v1 \
   --num-episodes 10
 ```
 
@@ -333,10 +408,13 @@ arm is present.
 
 What's still single-recipe (would need code changes for other shapes):
 
-- The state recipe is always EE-pose + gripper qpos per arm. Use joint-state
+- The state recipe is always EE-pose + gripper qpos per arm. Using joint-state
   instead would need a small edit in `state_recipe()`.
 - The script assumes PhysicsBench naming (`observation.robotN_*`,
   `observation.rgb_*_cam`). Datasets with different naming conventions need
   the regexes in `detect_cameras` / `detect_arms` extended.
 - Privileged sim-state keys are dropped via the whitelist (we only KEEP what's
   built), so any new privileged key is auto-excluded.
+- Only PhysicsBench codebase versions v2.1 and v3.0 are supported. New layouts
+  would need a new `iter_<version>` reader function and a dispatch branch in
+  `convert()`.
