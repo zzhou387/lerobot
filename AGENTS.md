@@ -1,4 +1,6 @@
-This file provides guidance to AI agents when working with code in this repository.
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 > **User-facing help → [`AGENT_GUIDE.md`](./AGENT_GUIDE.md)** (SO-101 setup, recording, picking a policy, training duration, eval — with copy-pasteable commands).
 
@@ -23,8 +25,9 @@ git lfs install && git lfs pull             # Test artifacts
 
 ```bash
 uv run pytest tests -svv --maxfail=10                 # All tests
-DEVICE=cuda make test-end-to-end                      # All E2E tests
-pre-commit run --all-files                           # Lint + format (ruff, typos, bandit, etc.)
+uv run pytest tests/path/to/test_file.py::test_name   # Single test
+DEVICE=cuda make test-end-to-end                      # All E2E tests (per-policy targets also exist, e.g. test-act-ete-train)
+pre-commit run --all-files                            # Lint + format (ruff, typos, bandit, etc.)
 ```
 
 ## Architecture (`src/lerobot/`)
@@ -54,3 +57,4 @@ pre-commit run --all-files                           # Lint + format (ruff, typo
 - **Optional dependencies**: many policies, envs, and robots are behind extras (e.g., `lerobot[aloha]`). New imports for optional packages must be guarded or lazy. See `pyproject.toml [project.optional-dependencies]`.
 - **Video decoding**: datasets can store observations as video files. `LeRobotDataset` handles frame extraction, but tests need ffmpeg installed.
 - **Prioritize use of `uv run`** to execute Python commands (not raw `python` or `pip`).
+- **Disclose AI assistance in PRs**: per [`AI_POLICY.md`](./AI_POLICY.md), substantial AI-generated changes must be flagged in the PR description, and the human author is expected to fully understand and verify them.

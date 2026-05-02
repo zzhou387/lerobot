@@ -271,7 +271,6 @@ uv run lerobot-train \
   --policy.type=diffusion --policy.device=cuda \
   --policy.crop_shape='[240,320]' --policy.push_to_hub=false \
   --batch_size=4 --steps=2000 \
-  --policy.scheduler_decay_steps=2000 \
   --eval_freq=0 --save_freq=500 --log_freq=20 \
   --wandb.enable=false \
   --output_dir=outputs/train/dp_laptop_iter --job_name=dp_laptop_iter
@@ -304,7 +303,6 @@ uv run lerobot-train \
   --policy.type=diffusion --policy.device=cuda \
   --policy.crop_shape='[480,640]' --policy.push_to_hub=false \
   --batch_size=32 --steps=80000 \
-  --policy.scheduler_decay_steps=80000 \
   --eval_freq=0 --save_freq=10000 --log_freq=100 \
   --wandb.enable=true \
   --output_dir=outputs/train/dp_edge_slide_v1 \
@@ -314,25 +312,103 @@ uv run lerobot-train \
 Reasoning for these numbers (per [`AGENT_GUIDE.md`](../AGENT_GUIDE.md) §7):
 - 80k steps ≈ ~13 epochs at batch 32 over ~196k frames — within the recommended
   80k–150k range for single-task DP.
-- `scheduler_decay_steps=80000` matches `steps` — otherwise the cosine LR
-  schedule won't decay (default is 30k, sized for longer runs).
+- LR schedule: `DiffusionConfig` uses HF diffusers' cosine scheduler with
+  `scheduler_warmup_steps=500`, and decay automatically spans the remaining
+  `--steps`. There is **no** `scheduler_decay_steps` flag on
+  `DiffusionConfig` (that field exists on other policies like SmolVLA, but
+  passing it to DP raises `DecodingError`).
 - `eval_freq=0` because **there is no sim env registered for this task** in
   LeRobot — eval needs a separate path (replay-based or running PhysicsBench
   itself with the trained policy).
 
 ### C. Eval (no in-training rollout possible)
 
-For now there's no `--env.type=pb-pr-edge-slide-v1` registered in
-[`src/lerobot/envs/`](../src/lerobot/envs/). Two paths:
+There's no `--env.type=pb-pr-edge-slide-v1` registered in
+[`src/lerobot/envs/`](../src/lerobot/envs/) so `lerobot-eval` can't drive the
+sim directly. Two-tier eval below: action-MSE first as a cheap screen,
+PhysicsBench-driven rollout second for the real number.
 
-1. **Action-MSE on a held-out split.** Cheap; use it to detect
-   over/under-fitting.
-2. **Run the trained policy in PhysicsBench directly.** PhysicsBench has its own
-   `pb.make("pb-pr-edge-slide-v1")` env. Wrap the trained policy and roll it out
-   from `physicsbench` — see [`PhysicsBench-main/physicsbench/policy/`](../PhysicsBench-main/physicsbench/policy/).
-   This is the "real" evaluation.
+#### Tier 1 — Action-MSE on held-out split (cheap, ~5 min, CPU-OK)
 
-Wiring (2) up is a separate task — not in scope for this report.
+Detects over/under-fit and screens checkpoints before paying for sim rollouts.
+
+```bash
+# 1. Convert a held-out 30-episode val slice (next 30 rating-5 episodes after the
+#    first 100 we trained on)
+uv run python scripts/convert_physicsbench_to_lerobot.py \
+  --src-path /home/ubuntu/dataset \
+  --dst-repo-id manav-robotics/pb-pr-edge-slide-v1-lerobot-val30 \
+  --skip-episodes 100 --num-episodes 30
+
+# 2. Run action-MSE on each saved checkpoint
+uv run python scripts/eval_dp_action_mse.py \
+  --policy-path outputs/train/dp_edge_slide_pilot100/checkpoints/last/pretrained_model \
+  --val-repo-id manav-robotics/pb-pr-edge-slide-v1-lerobot-val30 \
+  --output outputs/eval/dp_pilot100/action_mse.json
+```
+
+Reports per-step MSE + per-dim breakdown. Use to pick the best checkpoint
+before the rollout step.
+
+#### Tier 2 — PhysicsBench rollout (the real eval, ~30–45 min for 50 eps)
+
+PhysicsBench exposes its own gym-style env via `pb.make(task_id, ...)` and
+already has an eval harness ([`physicsbench/eval/harness.py`](../PhysicsBench/physicsbench/eval/harness.py))
+that wraps an `act(obs)/reset()` policy. We add a thin LeRobot adapter that
+runs episodes directly (skipping the harness so we can pass `config_overrides`
+for the FPS subtlety below).
+
+PhysicsBench is vendored under [`PhysicsBench/`](../PhysicsBench/), not
+installed into the lerobot venv — its sim deps (`robosuite`, `mujoco`,
+`opencv-python`, `lxml`, `flask`, `pyarrow`) need to be installed alongside
+lerobot before rollouts will run:
+
+```bash
+uv pip install "robosuite>=1.4" "mujoco>=3.0,<3.3" opencv-python lxml flask pyarrow
+```
+
+The eval script auto-adds `PhysicsBench/` to `sys.path`, so `physicsbench`
+imports without a separate install step.
+
+```bash
+uv run python scripts/eval_dp_in_physicsbench.py \
+  --policy-path outputs/train/dp_edge_slide_pilot100/checkpoints/last/pretrained_model \
+  --task-id pb-pr-edge-slide-v1 \
+  --n-episodes 50 --seed-offset 1000 \
+  --output outputs/eval/dp_pilot100/results.json
+```
+
+Reports `mean_score`, `std_score`, `success_rate (>0.9)`, `mean_length`, plus
+per-episode dump. Defaults to `obs_mode="combo"` (proprio+cameras) per
+[`PhysicsBench/CLAUDE.md`](../PhysicsBench/CLAUDE.md).
+
+For faster rollouts, the script switches the diffusion scheduler to DDIM with
+`num_inference_steps=10` at load time (~10× faster than the DDPM-100 default
+at near-equal quality).
+
+#### Subtlety to validate before trusting the rollout number
+
+**FPS mismatch.** Training data is subsampled 100→25 Hz; PhysicsBench's
+`edge_slide_v1` defaults to `control_freq=100`. DP outputs an action expecting
+25 Hz application. Three options, in order of cleanness:
+
+1. Override `control_freq=25` when calling `pb.make(...)` — closes the gap.
+2. Apply DP action at 25 Hz, hold-zero for the other 3/4 ticks at 100 Hz —
+   matches what subsampled data implies (assumes deltas are per-step).
+3. Apply DP action and repeat 4× — will overshoot, wrong.
+
+The eval script uses option (1) by default. Sanity-check on 5 eps with
+options (1) and (2) before committing to the full 50-ep run; if the success
+rate is materially different, the FPS recipe matters.
+
+#### Output directory layout
+
+```
+outputs/eval/dp_pilot100/
+├── action_mse.json          # Tier 1: per-step + per-dim MSE
+├── results.json             # Tier 2: aggregated + per-episode rollout metrics
+└── videos/                  # if --save-videos: rendered ego cam per episode
+```
 
 ---
 

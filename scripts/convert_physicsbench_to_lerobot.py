@@ -54,9 +54,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
+import math
 import re
 import shutil
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -66,9 +69,9 @@ import torch
 from torchcodec.decoders import VideoDecoder
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.utils.constants import HF_LEROBOT_HOME as LEROBOT_CACHE
 
 HF_HUB_CACHE = Path.home() / ".cache" / "huggingface" / "hub"
-LEROBOT_CACHE = Path.home() / ".cache" / "huggingface" / "lerobot"
 
 
 # ── source resolution ───────────────────────────────────────────────────────
@@ -255,19 +258,30 @@ def iter_v21(
     needed_cols: list[str],
     min_rating: int,
     max_episodes: int,
+    skip_episodes: int = 0,
 ):
-    """Yield EpisodePayload for v2.1 datasets, filtered by annotation_rating."""
+    """Yield EpisodePayload for v2.1 datasets, filtered by annotation_rating.
+
+    `skip_episodes` skips the first N rating-passing episodes before yielding
+    any — useful for cleanly carving train/val splits from the same source
+    (e.g. train on first 100, validate on the next 30).
+    """
     meta_files = sorted((src / "meta").glob("episode_*_metadata.json"))
     if not meta_files:
         raise FileNotFoundError(f"No v2.1 episode metadata under {src}/meta/")
 
     kept = 0
     skipped = 0
+    skipped_for_offset = 0
     for meta_path in meta_files:
         meta = json.loads(meta_path.read_text())
         rating = meta.get("annotation_rating")
         if rating is None or rating < min_rating:
             skipped += 1
+            continue
+
+        if skipped_for_offset < skip_episodes:
+            skipped_for_offset += 1
             continue
 
         episode_id = _v21_extract_id(meta_path)
@@ -297,7 +311,10 @@ def iter_v21(
         if max_episodes > 0 and kept >= max_episodes:
             break
 
-    print(f"[v21] kept {kept}, skipped {skipped} (rating < {min_rating})")
+    print(
+        f"[v21] kept {kept}, skipped {skipped} (rating < {min_rating}), "
+        f"skipped {skipped_for_offset} rating-passing for --skip-episodes offset"
+    )
 
 
 # ── v3.0 reader ─────────────────────────────────────────────────────────────
@@ -419,6 +436,114 @@ def build_features_dict(
     }
 
 
+# ── per-episode write (shared between single- and multi-process paths) ─────
+
+
+def _write_episode(
+    new_ds: LeRobotDataset,
+    payload: "EpisodePayload",
+    cam_rename: dict[str, str],
+    state_cols: list[str],
+    action_cols: list[str],
+    global_task_text: str,
+    decoders: VideoDecoderCache,
+) -> int:
+    """Push one episode's frames into ``new_ds`` and finalize that episode.
+
+    Returns the number of frames written.
+    """
+    state_arr = payload.sub_df[state_cols].to_numpy(dtype=np.float32)
+    action_arr = payload.sub_df[action_cols].to_numpy(dtype=np.float32)
+    task_text = payload.task_text or global_task_text
+
+    for i in range(len(payload.sub_df)):
+        frame: dict = {
+            "task": task_text,
+            "observation.state": state_arr[i],
+            "action": action_arr[i],
+        }
+        for src_key, new_key in cam_rename.items():
+            frame[new_key] = decoders.read_frame(
+                payload.cam_video_paths[src_key], payload.cam_indices[i]
+            )
+        new_ds.add_frame(frame)
+    new_ds.save_episode()
+    return len(payload.sub_df)
+
+
+# ── multi-process worker ───────────────────────────────────────────────────
+
+
+def _worker_convert_slice(
+    worker_id: int,
+    output_root: str,
+    src: str,
+    cam_rename: dict[str, str],
+    cam_rate_col: str,
+    needed_cols: list[str],
+    state_cols: list[str],
+    action_cols: list[str],
+    cam_fps: int,
+    features: dict,
+    robot_type: str | None,
+    global_task_text: str,
+    min_rating: int,
+    skip_episodes: int,
+    num_episodes: int,
+    codebase_version: str,
+) -> tuple[str, int, int]:
+    """Convert an episode slice into a fresh LeRobet dataset under ``output_root``.
+
+    Args paths are passed as ``str`` (not ``Path``) because some multiprocessing
+    start methods don't pickle ``Path`` cleanly across module versions.
+
+    Returns ``(output_root, n_episodes_written, n_frames_written)``.
+    """
+    src_path = Path(src)
+    output_path = Path(output_root)
+
+    new_ds = LeRobotDataset.create(
+        repo_id=f"local-staging/worker-{worker_id}",
+        root=output_path,
+        fps=int(cam_fps),
+        features=features,
+        robot_type=robot_type,
+        use_videos=True,
+    )
+    decoders = VideoDecoderCache()
+
+    if codebase_version.startswith("v2"):
+        episode_iter = iter_v21(
+            src_path, cam_rename, cam_rate_col, needed_cols, min_rating, num_episodes,
+            skip_episodes=skip_episodes,
+        )
+    else:
+        episode_iter = iter_v3(src_path, cam_rename, cam_rate_col, needed_cols, num_episodes)
+
+    n_eps = 0
+    n_frames = 0
+    for payload, full_len in episode_iter:
+        wrote = _write_episode(
+            new_ds, payload, cam_rename, state_cols, action_cols, global_task_text, decoders,
+        )
+        n_eps += 1
+        n_frames += wrote
+        print(f"[w{worker_id}] ep {payload.episode_id}: {wrote} frames (orig {full_len})", flush=True)
+
+    new_ds.finalize()
+    return output_root, n_eps, n_frames
+
+
+def _count_v21_rating_passing(src: Path, min_rating: int) -> int:
+    """Count v2.1 episodes whose annotation_rating >= min_rating."""
+    n = 0
+    for mp in sorted((src / "meta").glob("episode_*_metadata.json")):
+        rating = (json.loads(mp.read_text()).get("annotation_rating") or 0)
+        if rating >= min_rating:
+            n += 1
+    return n
+
+
 # ── main flow ───────────────────────────────────────────────────────────────
 
 
@@ -429,6 +554,8 @@ def convert(
     include_ft: bool,
     overwrite: bool,
     min_rating: int,
+    skip_episodes: int = 0,
+    num_workers: int = 1,
 ) -> None:
     src_info = json.loads((src / "meta" / "info.json").read_text())
     src_features = dict(src_info["features"])
@@ -488,14 +615,16 @@ def convert(
     needed_cols = [cam_rate_col] + state_cols + action_cols
 
     if codebase_version.startswith("v2"):
-        episode_iter = iter_v21(src, cam_rename, cam_rate_col, needed_cols, min_rating, num_episodes)
         global_task_text = (
             src_info.get("task_config", {}).get("description")
             or src_info.get("task_id")
             or "task"
         )
     elif codebase_version.startswith("v3"):
-        episode_iter = iter_v3(src, cam_rename, cam_rate_col, needed_cols, num_episodes)
+        if skip_episodes:
+            raise ValueError("--skip-episodes is only supported for v2.1 sources.")
+        if num_workers > 1:
+            raise ValueError("--num-workers > 1 is only supported for v2.1 sources.")
         global_task_text = (
             src_info.get("task_config", {}).get("description")
             or src_info.get("task_id")
@@ -508,39 +637,106 @@ def convert(
         cam_rename, len(state_cols), state_names, len(action_cols), action_names, video_shape
     )
 
-    new_ds = LeRobotDataset.create(
-        repo_id=dst_repo_id,
-        fps=int(cam_fps),
-        features=features,
-        robot_type=src_info.get("robot_type"),
-        use_videos=True,
-    )
-    print(f"[convert] writing to: {new_ds.root}")
+    if num_workers <= 1:
+        # Single-process path (unchanged from the original implementation).
+        if codebase_version.startswith("v2"):
+            episode_iter = iter_v21(
+                src, cam_rename, cam_rate_col, needed_cols, min_rating, num_episodes,
+                skip_episodes=skip_episodes,
+            )
+        else:
+            episode_iter = iter_v3(src, cam_rename, cam_rate_col, needed_cols, num_episodes)
 
-    written = 0
-    for payload, full_len in episode_iter:
-        state_arr = payload.sub_df[state_cols].to_numpy(dtype=np.float32)
-        action_arr = payload.sub_df[action_cols].to_numpy(dtype=np.float32)
-        task_text = payload.task_text or global_task_text
+        new_ds = LeRobotDataset.create(
+            repo_id=dst_repo_id,
+            fps=int(cam_fps),
+            features=features,
+            robot_type=src_info.get("robot_type"),
+            use_videos=True,
+        )
+        print(f"[convert] writing to: {new_ds.root}")
 
-        for i in range(len(payload.sub_df)):
-            frame: dict = {
-                "task": task_text,
-                "observation.state": state_arr[i],
-                "action": action_arr[i],
-            }
-            for src_key, new_key in cam_rename.items():
-                frame[new_key] = decoders.read_frame(
-                    payload.cam_video_paths[src_key], payload.cam_indices[i]
+        for payload, full_len in episode_iter:
+            wrote = _write_episode(
+                new_ds, payload, cam_rename, state_cols, action_cols, global_task_text, decoders,
+            )
+            print(f"[convert] ep {payload.episode_id}: wrote {wrote} frames (orig {full_len} @ source rate)")
+        new_ds.finalize()
+        print(f"[convert] done. dataset at {new_ds.root}")
+        print(f"[convert] total frames: {new_ds.meta.total_frames}, episodes: {new_ds.meta.total_episodes}")
+        return
+
+    # ── multi-process path ───────────────────────────────────────────────
+    # Each worker converts a disjoint episode slice into its own staging
+    # dataset, then we use lerobot.datasets.merge_datasets() to combine them.
+    # v2.1 only (v3 path is rejected above).
+    total_pass = _count_v21_rating_passing(src, min_rating)
+    available = total_pass - skip_episodes
+    if available <= 0:
+        raise ValueError(
+            f"No episodes available after --skip-episodes={skip_episodes} "
+            f"with --min-rating={min_rating} ({total_pass} rating-passing total)."
+        )
+    effective_n = available if num_episodes < 0 else min(num_episodes, available)
+    per_worker = math.ceil(effective_n / num_workers)
+
+    slices: list[tuple[int, int]] = []
+    for i in range(num_workers):
+        slice_skip = skip_episodes + i * per_worker
+        slice_n = min(per_worker, effective_n - i * per_worker)
+        if slice_n <= 0:
+            break
+        slices.append((slice_skip, slice_n))
+
+    print(f"[convert] parallel: {len(slices)} workers, ~{per_worker} eps each "
+          f"(total {effective_n} eps to process)")
+
+    from lerobot.datasets import merge_datasets
+
+    # Use a temp dir on the same filesystem as the final destination so the
+    # merge step can rename files cheaply instead of copying across mounts.
+    with tempfile.TemporaryDirectory(prefix="convert_pb_", dir=str(dst_root.parent)) as tmpdir:
+        worker_roots = [Path(tmpdir) / f"worker_{i}" for i in range(len(slices))]
+
+        with concurrent.futures.ProcessPoolExecutor(max_workers=len(slices)) as ex:
+            futures = []
+            for i, ((slice_skip, slice_n), worker_root) in enumerate(zip(slices, worker_roots)):
+                fut = ex.submit(
+                    _worker_convert_slice,
+                    i,
+                    str(worker_root),
+                    str(src),
+                    cam_rename,
+                    cam_rate_col,
+                    needed_cols,
+                    state_cols,
+                    action_cols,
+                    cam_fps,
+                    features,
+                    src_info.get("robot_type"),
+                    global_task_text,
+                    min_rating,
+                    slice_skip,
+                    slice_n,
+                    codebase_version,
                 )
-            new_ds.add_frame(frame)
-        new_ds.save_episode()
-        written += 1
-        print(f"[convert] ep {payload.episode_id}: wrote {len(payload.sub_df)} frames (orig {full_len} @ source rate)")
+                futures.append(fut)
+            for f in concurrent.futures.as_completed(futures):
+                root, n_eps, n_frames = f.result()
+                print(f"[convert] worker done: {Path(root).name} → {n_eps} ep, {n_frames} frames")
 
-    new_ds.finalize()
-    print(f"[convert] done. dataset at {new_ds.root}")
-    print(f"[convert] total frames: {new_ds.meta.total_frames}, episodes: {new_ds.meta.total_episodes}")
+        worker_dss = [
+            LeRobotDataset(repo_id=f"local-staging/worker-{i}", root=root)
+            for i, root in enumerate(worker_roots)
+        ]
+        print(f"[convert] merging {len(worker_dss)} worker datasets → {dst_root}")
+        merged = merge_datasets(
+            datasets=worker_dss,
+            output_repo_id=dst_repo_id,
+            output_dir=dst_root,
+        )
+        print(f"[convert] done. dataset at {merged.root}")
+        print(f"[convert] total frames: {merged.meta.total_frames}, episodes: {merged.meta.total_episodes}")
 
 
 def main() -> None:
@@ -563,6 +759,13 @@ def main() -> None:
     )
     parser.add_argument("--num-episodes", type=int, default=10, help="Episodes to convert. -1 for all.")
     parser.add_argument(
+        "--skip-episodes",
+        type=int,
+        default=0,
+        help="v2.1 only: skip the first N rating-passing episodes before converting any. "
+        "Use to carve train/val splits from the same source.",
+    )
+    parser.add_argument(
         "--min-rating",
         type=int,
         default=5,
@@ -578,6 +781,16 @@ def main() -> None:
         action="store_true",
         help="Delete the destination dir if it already exists.",
     )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=1,
+        help="Multi-process the conversion across N workers. v2.1 only. "
+        "Each worker converts a disjoint episode slice into a staging dataset, "
+        "then results are merged via lerobot.datasets.merge_datasets. "
+        "4-8 is a reasonable starting point on a modern CPU; tune down if you "
+        "see ffmpeg encoder contention.",
+    )
     args = parser.parse_args()
 
     src = resolve_src_path(args.src_repo_id, args.src_path)
@@ -589,7 +802,11 @@ def main() -> None:
     else:
         raise ValueError("Provide --dst-repo-id when using --src-path.")
 
-    convert(src, dst_repo_id, args.num_episodes, args.include_ft, args.overwrite, args.min_rating)
+    convert(
+        src, dst_repo_id, args.num_episodes, args.include_ft, args.overwrite, args.min_rating,
+        skip_episodes=args.skip_episodes,
+        num_workers=args.num_workers,
+    )
 
 
 if __name__ == "__main__":
