@@ -14,7 +14,9 @@ across tasks; only the per-task numbers and dataset shapes differ.
 | Task | Train frames | Steps | Epochs | Tier-1 overall MSE | **Tier-2 success rate (50 ep)** | Train wall |
 |---|---:|---:|---:|---:|---:|---:|
 | `pb-pr-edge-slide-v1` | 72,367 | 30,000 | ~13 | 0.0215 | **34.0%** (17/50) | ~8.6 h |
+| `pb-pr-edge-slide-v1` (cont'd to 50k) | 72,367 | 50,000 | ~22 | _not run_ | 28.0% (14/50) — **worse** ([overfit](#911-step-50k-overfit-followup)) | ~13.4 h |
 | `pb-pr-domino-select-v1` | 19,555 | 50,000 | ~82 | _not run_ | **80.0%** (40/50) | ~11.7 h |
+| `pb-pr-domino-single-v1` | 16,245 | 50,000 | ~98 | _not run_ | **70.0%** (35/50) | ~11.7 h |
 
 (Add new rows as more tasks come online.)
 
@@ -94,15 +96,36 @@ install of the package itself.
 
 ## 3. Per-task recipe
 
-Set `$TASK` once, then run the same three steps. Raw data is assumed at
-`/data/dataset/$TASK/` (downloaded via [scripts/fetch_from_s3.sh](fetch_from_s3.sh)
-from `s3://physicsbench-data/lerobot_v21/$TASK/`).
+Set `$TASK` once, then run the steps below in order. Raw data ends up at
+`/data/dataset/$TASK/`; converted data, checkpoints, and eval results all
+land under `/data/lerobot/...` per [§2.1](#21-disk-layout).
 
 ```bash
 TASK=pb-pr-edge-slide-v1   # or pb-pr-domino-select-v1, etc.
 ```
 
-### 3.1 Convert pilot100 split (training data)
+### 3.1 Fetch raw data from S3
+
+Source bucket / region in [scripts/config.conf](config.conf) —
+`physicsbench-data` / `ap-south-1`. Layout convention on S3 is
+`lerobot_v21/<task_id>/{meta,data,videos}/`.
+
+```bash
+./scripts/fetch_from_s3.sh lerobot_v21/$TASK /data/dataset/$TASK
+```
+
+Uses `aws s3 sync` so it's idempotent (re-running skips files that already
+match by size + timestamp). Pass `--dry-run` first if you're unsure how big
+the pull will be:
+
+```bash
+./scripts/fetch_from_s3.sh --dry-run lerobot_v21/$TASK /data/dataset/$TASK
+```
+
+Each task is typically ~5–15 GB. The script aborts up front if disk space is
+insufficient.
+
+### 3.2 Convert pilot100 split (training data)
 
 ```bash
 /home/ubuntu/lerobot/.venv/bin/python scripts/convert_physicsbench_to_lerobot.py \
@@ -116,7 +139,7 @@ Default `--min-rating 5` keeps only clean single-shot demos. With 4 workers
 this lands in ~25 min instead of ~90 min single-process. Output goes to
 `$HF_LEROBOT_HOME/manav-robotics/${TASK}-lerobot-pilot100/`.
 
-### 3.2 (Optional) Convert val30 split for Tier-1 eval
+### 3.3 (Optional) Convert val30 split for Tier-1 eval
 
 ```bash
 /home/ubuntu/lerobot/.venv/bin/python scripts/convert_physicsbench_to_lerobot.py \
@@ -128,7 +151,7 @@ this lands in ~25 min instead of ~90 min single-process. Output goes to
 
 Skip this if you only want the Tier-2 (sim) number.
 
-### 3.3 Train DP
+### 3.4 Train DP
 
 ```bash
 wandb login   # one-time, paste API key from https://wandb.ai/authorize
@@ -171,7 +194,7 @@ much longer — see [§9.2](#92-pb-pr-domino-select-v1)).
   `--config_path` must point at a real local file. `HFValidationError:
   Repo id must be in the form…` means the path is wrong.
 
-### 3.4 Tier-1 eval — action MSE on val30 (cheap, ~5 min)
+### 3.5 Tier-1 eval — action MSE on val30 (cheap, ~5 min)
 
 Skip if val30 wasn't converted.
 
@@ -183,7 +206,7 @@ STEP=30000   # whichever checkpoint you want to score
   --output /data/lerobot/outputs/eval/dp_${TASK}_step${STEP}/action_mse_full.json
 ```
 
-### 3.5 Tier-2 eval — PhysicsBench rollout (the real number, ~30–60 min)
+### 3.6 Tier-2 eval — PhysicsBench rollout (the real number, ~30–60 min)
 
 ```bash
 export PYTHONUNBUFFERED=1   # otherwise stdout buffers when piped
@@ -207,6 +230,41 @@ tasks that don't have an ego cam.
 `--control-freq` defaults to **25** to match the dataset's 25 Hz subsample
 (PhysicsBench tasks default to 100 Hz; running the env at 100 Hz with a
 policy trained on 25 Hz subsampled deltas overshoots).
+
+### 3.7 (Optional) Push checkpoint to S3
+
+For backup or sharing across machines. Push only the inference-ready
+`pretrained_model/` directory (~3 GB) — skipping `training_state/` halves
+the upload size, and you don't need it unless you intend to resume training:
+
+```bash
+STEP=30000   # whichever checkpoint to back up; or use 'last'
+
+./scripts/push_to_s3.sh \
+  /data/lerobot/outputs/train/dp_${TASK}_pilot100/checkpoints/${STEP}/pretrained_model \
+  manav/checkpoints/dp_${TASK}_pilot100_step${STEP}
+```
+
+Uses `aws s3 sync` (add/update only — won't delete remote files).
+
+To push the full run dir (checkpoints + wandb logs, ~13 GB):
+
+```bash
+./scripts/push_to_s3.sh \
+  /data/lerobot/outputs/train/dp_${TASK}_pilot100 \
+  manav/runs/dp_${TASK}_pilot100
+```
+
+`--dry-run` works the same as for fetch; `--delete` is opt-in for one-way
+mirroring (rarely what you want).
+
+To pull the checkpoint back on another machine:
+
+```bash
+./scripts/fetch_from_s3.sh \
+  manav/checkpoints/dp_${TASK}_pilot100_step${STEP} \
+  /data/lerobot/outputs/train/dp_${TASK}_pilot100/checkpoints/${STEP}/pretrained_model
+```
 
 ## 4–8. Caveats and global notes
 
@@ -296,12 +354,40 @@ NRMSE ≈ 1.0 on translation deltas → looks mean-predictor level. Misleading
 ├── pb-pr-edge-slide-v1-lerobot-pilot100/
 └── pb-pr-edge-slide-v1-lerobot-val30/
 /data/lerobot/outputs/train/dp_edge_slide_pilot100/        ← legacy job_name
-/data/lerobot/outputs/eval/dp_pilot100_step30000/          ← legacy eval dir
+/data/lerobot/outputs/eval/dp_pilot100_step30000/          ← legacy eval dir (step-30k)
 ├── action_mse_full.json
 ├── rollout_50ep.json
 ├── rollout_videos.json                                    ← 5-seed video run
 └── videos/                                                ← 5 ego-cam mp4s
+/data/lerobot/outputs/eval/dp_pb-pr-edge-slide-v1_step50000/  ← step-50k follow-up
+├── rollout_50ep.json
+└── videos/                                                ← 50 ego-cam mp4s
 ```
+
+#### 9.1.1 step-50k overfit follow-up
+
+After the original 30k run, training was continued to **step 50,000** (≈22
+epochs over the 72k-frame pilot). Tier-2 was re-run on the same seeds
+(1000–1049) with the same `--max-episode-steps=1000`:
+
+| | step 30k (13 epochs) | **step 50k (22 epochs)** |
+|---|---:|---:|
+| Final train loss | 0.0184 | 0.0167 |
+| **Success rate (50 ep)** | **34.0%** (17/50) | **28.0%** (14/50) |
+| 95% CI | 22–48% | 17–41% |
+| Mean length | 852 | 911 / 1000 |
+| Failure mode | mixed (truncations + fall-offs) | **92% (33/36) hit cap** |
+| Wall time | 61 min | 67 min |
+
+**Read.** Train loss kept dropping but rollout success dropped 6 percentage
+points. CIs overlap so it's not stat-sig as a single comparison, but the
+direction matches the DP overfit prediction (10–15 epochs is the typical
+sweet spot; 22 is past it for a 72k-frame dataset). Failure profile also
+shifted toward "trying but timing out" — consistent with the policy
+memorizing a slightly off trajectory and replaying it stubbornly.
+
+**Action**: keep using step-30000 as the operational edge-slide checkpoint.
+The 50k checkpoints aren't worth backing up.
 
 ### 9.2 `pb-pr-domino-select-v1`
 
@@ -325,7 +411,7 @@ NRMSE ≈ 1.0 on translation deltas → looks mean-predictor level. Misleading
 | Wandb run id | `8hmaoc87` (project `physicsbench`) |
 
 **Tier-1**: not run (val30 not converted). Could be added with the recipe
-in §3.2 + §3.4.
+in §3.3 + §3.5.
 
 **Tier-2 (PhysicsBench rollout, 50 ep, step 50000):**
 
@@ -342,8 +428,8 @@ in §3.2 + §3.4.
 Without the val30 numbers, we can't say whether this 80% reflects
 generalization or memorization of the pilot demos. The fact that all 10
 failures were timeouts (not fail states) is consistent with both stories.
-Cheap to check — see [§3.2](#32-optional-convert-val30-split-for-tier-1-eval)
-+ [§3.4](#34-tier-1-eval--action-mse-on-val30-cheap-5-min).
+Cheap to check — see [§3.3](#33-optional-convert-val30-split-for-tier-1-eval)
++ [§3.5](#35-tier-1-eval--action-mse-on-val30-cheap-5-min).
 
 **Video capture**: this run saved videos for **all 50 episodes** to
 `/data/lerobot/outputs/eval/dp_pb-pr-domino-select-v1_step50000/videos/`
@@ -362,24 +448,125 @@ to find the failures: `ls .../videos/ | grep _fail_`.
 └── videos/                                                ← 50 exo_front_cam mp4s
 ```
 
+### 9.3 `pb-pr-domino-single-v1`
+
+**Dataset (pilot100):**
+
+| | |
+|---|---|
+| Episodes / frames | 100 / 16,245 (avg ~162 frames/ep ≈ 6.5 sim-seconds — even shorter than domino-select) |
+| Source | raw v2.1 from S3 at `/data/dataset/pb-pr-domino-single-v1/` |
+| Cameras | `exo_front, exo_left, exo_right, gripper` (480×640) — same set as domino-select, no `ego` cam |
+| State / action | 9-dim / 7-dim |
+
+**Training:**
+
+| | |
+|---|---|
+| Final step | 50,000 (≈ **98 epochs** — even further into overfit territory than domino-select) |
+| Final train loss | 0.01027 |
+| Total wall time | ~11.7 h on L40S |
+| Checkpoints saved | 5000, 10000, …, 50000 (`last` → 50000) |
+| Wandb run id | `yt97uqbs` (project `physicsbench`) |
+
+**Tier-1**: not run.
+
+**Tier-2 (PhysicsBench rollout, 50 ep, step 50000):**
+
+| | |
+|---|---|
+| **Success rate** | **70.0%** (35 / 50), 95% CI ≈ 56–81% |
+| Mean score | 0.774 ± 0.377 |
+| Mean length | 420.7 / 1000 step cap |
+| Wall time | 35 min (41.5 s/ep) |
+| Successful-episode mean length | 250 steps (~10 s) |
+| Failure-episode mean length | 820 steps |
+| Failure breakdown | **10 timeouts** (hit 1000-step cap) + **5 mid-episode terminations** (`terminated=True`, score≤0.9) |
+
+**Note on `mean_score` vs `success_rate`**: 0.774 vs 0.700 — they don't align
+because some non-success episodes have non-zero partial scores (~0.25 on
+average across the 15 failures). Domino-single's task scoring isn't strictly
+binary unlike edge-slide's; partial credit accumulates for partially-completed
+sub-goals.
+
+**Failure profile differs from domino-select**: domino-select had all 10
+failures hit the 1000-step cap (no fail-states); domino-single had 5/15
+mid-episode terminations. Suggests domino-single has a stricter termination
+condition (e.g. wrong domino touched → episode ends, vs domino-select
+where the policy just keeps trying).
+
+**Video capture**: this run saved videos for **all 50 episodes** to
+`/data/lerobot/outputs/eval/dp_pb-pr-domino-single-v1_step50000/videos/`
+(17 MB total at `rgb_exo_front_cam`). To find the failures with
+mid-episode termination (the more diagnostic ones):
+
+```bash
+ls /data/lerobot/outputs/eval/dp_pb-pr-domino-single-v1_step50000/videos/ | grep _fail_ | grep -v _len1000
+```
+
+**Artifacts:**
+
+```
+/data/lerobot/cache/huggingface/lerobot/manav-robotics/
+└── pb-pr-domino-single-v1-lerobot-pilot100/
+/data/lerobot/outputs/train/dp_pb-pr-domino-single-v1_pilot100/
+└── checkpoints/{5000,10000,...,50000,last}/
+/data/lerobot/outputs/eval/dp_pb-pr-domino-single-v1_step50000/
+├── rollout_50ep.json
+└── videos/                                                ← 50 exo_front_cam mp4s
+```
+
 ## 10. Cross-task observations (so far)
 
-With two tasks done it's still too early to draw conclusions, but worth
-noting:
+With three tasks done it's still early, but two patterns are starting to
+hold up:
 
-- **Episode length matters more than episode count.** Domino-select has
-  100 episodes × ~196 frames each (19.5k frames total) and reached 80%
-  success. Edge-slide has 100 × ~720 each (72k frames) and reached 34%.
-  Same demo count, very different success — the domino dataset gave the
-  policy ~6× more passes per frame at 50k steps vs ~13 passes for
-  edge-slide at 30k.
-- **Failure profile differs by task.** Edge-slide failures include
-  fall-off terminations (object went over the table edge); domino-select
-  failures are all timeouts (policy approaches but doesn't finish in time).
-  Failure mix is a useful diagnostic in itself.
-- **Auto-derived camera map saved time.** Adding domino-select required
+- **Demo *coverage* (frames) matters more than demo *count* (episodes).**
+  All three tasks used 100-episode pilots, but their frame counts vary
+  ~4.5×, and that — not the demo count — tracks the success rate:
+
+  | Task | Frames | Epochs at last step | Tier-2 success |
+  |---|---:|---:|---:|
+  | edge-slide | 72k | 13 | 34% |
+  | domino-select | 19.5k | 82 | 80% |
+  | domino-single | 16.2k | 98 | 70% |
+
+  The two short-episode domino tasks both massively over-train (82–98
+  epochs, well beyond DP's usual 10–15 sweet spot) and still produce
+  strong rollouts. Edge-slide trained ~6× *less* per frame and produced
+  the worst rollout. Hard to disentangle "task complexity" from "how
+  many epochs" without holding one fixed.
+
+  **Update from the step-50k follow-up on edge-slide** (see [§9.1.1](#911-step-50k-overfit-follow-up)):
+  continuing edge-slide training to step 50,000 (~22 epochs) **dropped**
+  success rate from 34% → 28%. So "more training" alone doesn't close
+  the gap on edge-slide — at this dataset size DP plateaus and starts to
+  overfit. The cross-task gap is more likely task complexity (contact-rich
+  edge-sliding-then-grasping is genuinely harder than domino selection)
+  than under-training of edge-slide. The likely lever is **more demo
+  coverage** (full 751-episode dataset), not more steps.
+- **Failure profile differs by task and is a useful diagnostic.**
+  Different tasks have different failure modes:
+  - Edge-slide: mix of 1000-step timeouts and short-length fall-off
+    terminations (object went over the table edge).
+  - Domino-select: 100% timeouts — policy doesn't violate state, just
+    runs out of time.
+  - Domino-single: 67% timeouts + 33% mid-episode terminations
+    (probably wrong-domino-touched). More sensitive termination
+    condition than domino-select.
+  Distinguishing "the policy never destabilizes but doesn't finish" vs
+  "the policy actively breaks the task" is informative — the former
+  responds well to more steps / more demos; the latter often needs
+  task-recipe tweaks.
+- **Auto-derived camera map saved time.** Both domino tasks required
   zero code changes to the eval adapter once `_derive_cam_map` was in
-  place — it picks up whatever the policy config expects.
+  place — it picks up whatever the policy config expects, even though
+  edge-slide uses `ego` and the domino tasks use `exo_front`.
+- **Domino tasks have non-binary task scores.** edge-slide reports
+  `score ∈ {0, 1}`; domino-single's failed episodes carry partial
+  credit (~0.25 mean for the 15 failures), so `mean_score` and
+  `success_rate` diverge slightly. Watch for both numbers when
+  interpreting future tasks.
 
 ## 11. Files added / changed during this work
 
